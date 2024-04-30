@@ -1,0 +1,122 @@
+#Most code from Nick Renotte. Modified lip reading model for performance in real time
+
+import os
+import cv2
+import tensorflow as tf
+import numpy as np
+from typing import List
+from matplotlib import pyplot as plt
+import imageio
+import dlib
+import gdown
+import pygame
+
+faceDetector = dlib.get_frontal_face_detector()
+
+dlibFaceLandmark = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+
+vocab = [x for x in "abcdefghijklmnopqrstuvwxyz'?!123456789 "]
+
+char_to_num = tf.keras.layers.StringLookup(vocabulary=vocab, oov_token="")
+num_to_char = tf.keras.layers.StringLookup(
+    vocabulary=char_to_num.get_vocabulary(), oov_token="", invert=True
+)
+
+print(
+    f"The vocabulary is: {char_to_num.get_vocabulary()} "
+    f"(size ={char_to_num.vocabulary_size()})"
+)
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv3D, LSTM, Dense, Dropout, Bidirectional, MaxPool3D, Activation, Reshape, SpatialDropout3D, BatchNormalization, TimeDistributed, Flatten
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ModelCheckpoint, LearningRateScheduler
+
+model = Sequential()
+model.add(Conv3D(128, 3, input_shape=(75,46,140,1), padding='same'))
+model.add(Activation('relu'))
+model.add(MaxPool3D((1,2,2)))
+
+model.add(Conv3D(256, 3, padding='same'))
+model.add(Activation('relu'))
+model.add(MaxPool3D((1,2,2)))
+
+model.add(Conv3D(75, 3, padding='same'))
+model.add(Activation('relu'))
+model.add(MaxPool3D((1,2,2)))
+
+model.add(TimeDistributed(Flatten()))
+
+model.add(Bidirectional(LSTM(128, kernel_initializer='Orthogonal', return_sequences=True)))
+model.add(Dropout(.5))
+
+model.add(Bidirectional(LSTM(128, kernel_initializer='Orthogonal', return_sequences=True)))
+model.add(Dropout(.5))
+
+model.add(Dense(char_to_num.vocabulary_size()+1, kernel_initializer='he_normal', activation='softmax'))
+
+def CTCLoss(y_true, y_pred):
+    batch_len = tf.cast(tf.shape(y_true)[0], dtype="int64")
+    input_length = tf.cast(tf.shape(y_pred)[1], dtype="int64")
+    label_length = tf.cast(tf.shape(y_true)[1], dtype="int64")
+
+    input_length = input_length * tf.ones(shape=(batch_len, 1), dtype="int64")
+    label_length = label_length * tf.ones(shape=(batch_len, 1), dtype="int64")
+
+    loss = tf.keras.backend.ctc_batch_cost(y_true, y_pred, input_length, label_length)
+    return loss
+
+model.compile(optimizer=tf.compat.v1.train.AdamOptimizer(learning_rate=0.0001), loss=CTCLoss)
+
+url = 'https://drive.google.com/uc?id=1vWscXs4Vt0a_1IH1-ct2TCgXAZT-N3_Y'
+output = 'checkpoints.zip'
+gdown.download(url, output, quiet=False)
+gdown.extractall('checkpoints.zip', 'models')
+
+model.load_weights('models/checkpoint')
+
+sequence = []
+sentence = []
+threshold = 0.4
+
+cap = cv2.VideoCapture(0)
+
+while True:
+    ret, frame = cap.read()
+    #gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    faces = faceDetector(frame)
+    for face in faces:
+        faceLandmarks = dlibFaceLandmark(frame, face)
+
+        for i in range(49, 68):
+            x = faceLandmarks.part(i).x
+            y = faceLandmarks.part(i).y
+
+            #cv2.circle(frame, (x, y), 1, (0, 255, 255), 3)
+        lowY = faceLandmarks.part(58).y - 140
+        lowX = faceLandmarks.part(49).x - 110
+        highY = faceLandmarks.part(52).y + 140
+        highX = faceLandmarks.part(55).x + 110
+        imgCrop = frame[lowY: highY, lowX: highX]
+        imgCrop = cv2.resize(imgCrop, (140, 46))
+        imgCrop = tf.image.rgb_to_grayscale(imgCrop)
+        imgCrop = tf.convert_to_tensor(imgCrop)
+        sequence.append(imgCrop)
+        sequence = sequence[-75:]
+        
+        if len(sequence) == 75:
+            res = model.predict(tf.expand_dims(sequence, axis=0))
+            decoded = tf.keras.backend.ctc_decode(res, input_length=[75], greedy=True)[0][0].numpy()
+            print('~'*100, 'PREDICTIONS')
+            print(decoded)
+            [tf.strings.reduce_join([num_to_char(word) for word in sentence]) for sentence in decoded]
+            sequence.clear()
+        
+    cv2.imshow("Face Landmarks", frame)
+
+    if cv2.waitKey(27) == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
